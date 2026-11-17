@@ -1,4 +1,8 @@
-
+// Package console implements the Revoke console API.
+//
+// The API is the whole control plane for the client's console. Who may do what comes from
+// ServerData.go at the module root; each account there proves itself with its own token, so a
+// request carrying somebody else's name is refused even though the whitelist is public.
 package console
 
 import (
@@ -17,9 +21,16 @@ import (
 )
 
 const (
+	// Retention is how long a command stays deliverable.
 	Retention = 15 * time.Minute
+
+	// MaxEvents bounds how many commands are kept.
 	MaxEvents = 500
+
+	// MaxBody caps a request body, so an oversized post cannot be used as a memory hammer.
 	MaxBody = 8 << 10
+
+	// MaxPayload caps the message/feature carried by a command.
 	MaxPayload = 512
 
 	commandPerMinute = 60
@@ -27,8 +38,11 @@ const (
 )
 
 var namePattern = regexp.MustCompile(`^[A-Za-z0-9_]{1,16}$`)
+
+// Action names the client understands. ServerData.go decides which of them are switched on.
 var actions = []string{"on", "off", "notify", "broadcast"}
 
+// Event is one console command, addressed to a target or to everybody (broadcast).
 type Event struct {
 	ID      int64  `json:"id"`
 	From    string `json:"from"`
@@ -38,10 +52,14 @@ type Event struct {
 	Time    int64  `json:"time"`
 }
 
+// Account is one entry of ServerData.go with its token already read from the environment.
 type Account struct {
+	// Display is the name other players see on broadcasts.
 	Display string
+	// Username is the Minecraft name this account must send.
 	Username string
 	token    string
+	// commands is nil when the account may use every enabled command.
 	commands map[string]bool
 }
 
@@ -49,11 +67,18 @@ func (account Account) allows(action string) bool {
 	return account.commands == nil || account.commands[action]
 }
 
+// Config is everything the API needs to answer a request.
 type Config struct {
-	accounts map[string]Account
+	accounts map[string]Account // lower-cased username -> account
 	enabled  map[string]bool
+	// Store keeps events between requests.
 	Store Store
+	// Shared is true when a shared store (KV/Upstash) is configured.
 	Shared bool
+	// ProfileURL overrides Minecraft's profile endpoint (used by tests); empty means the real one.
+	ProfileURL string
+	// Client makes that verification call; nil means a shared client.
+	Client *http.Client
 }
 
 var (
@@ -61,6 +86,7 @@ var (
 	defaultConfig *Config
 )
 
+// Default returns the process-wide configuration, built once per instance.
 func Default() *Config {
 	defaultOnce.Do(func() {
 		defaultConfig = FromEnv()
@@ -68,6 +94,8 @@ func Default() *Config {
 	return defaultConfig
 }
 
+// FromEnv resolves ServerData.go against the environment: each account's token comes from its
+// TokenEnv variable (or CONSOLE_TOKEN_<USERNAME>), never from the repository.
 func FromEnv() *Config {
 	config := &Config{
 		accounts: map[string]Account{},
@@ -116,6 +144,7 @@ func FromEnv() *Config {
 	return config
 }
 
+// tokenVariable is the environment variable holding an account's token.
 func tokenVariable(entry serverdata.Account) string {
 	if name := strings.TrimSpace(entry.TokenEnv); name != "" {
 		return name
@@ -124,6 +153,7 @@ func tokenVariable(entry serverdata.Account) string {
 	return "CONSOLE_TOKEN_" + strings.ToUpper(strings.TrimSpace(entry.Username))
 }
 
+// Warnings describes configuration that will silently refuse everybody, for the server's log.
 func (config *Config) Warnings() []string {
 	var warnings []string
 
@@ -144,13 +174,25 @@ func (config *Config) Warnings() []string {
 		}
 
 		if strings.TrimSpace(os.Getenv(tokenVariable(entry))) == "" {
-			warnings = append(warnings, "no token set for "+username+": export "+tokenVariable(entry))
+			warnings = append(warnings, "no fallback token set for "+username+" ("+tokenVariable(entry)+"): only a verified Minecraft login can use that account")
 		}
 	}
 
 	return warnings
 }
 
+// Authorize returns the account behind a request.
+//
+// Being listed in ServerData.go is what grants access; authorizing then comes down to proving the
+// request really is that account:
+//
+//   - the client's Minecraft login is checked against Minecraft's profile service, so naming
+//     somebody else fails even though the whitelist is public, and
+//   - an optional per-account token from the environment is accepted as a fallback for installs
+//     whose launcher has no live login to verify.
+//
+// The name in the request only selects the entry. Nothing the caller puts in the request body, and
+// no name alone, can authorize anything.
 func (config *Config) Authorize(request *http.Request) (Account, bool) {
 	if config == nil {
 		return Account{}, false
@@ -168,11 +210,19 @@ func (config *Config) Authorize(request *http.Request) (Account, bool) {
 
 	account, known := config.accounts[strings.ToLower(name)]
 
-	if !known || !tokenMatches(account.token, strings.TrimSpace(request.Header.Get("X-Console-Token"))) {
+	if !known {
 		return Account{}, false
 	}
 
-	return account, true
+	if tokenMatches(account.token, strings.TrimSpace(request.Header.Get("X-Console-Token"))) {
+		return account, true
+	}
+
+	if config.VerifySession(request.Context(), account.Username, strings.TrimSpace(request.Header.Get("X-Console-Session"))) {
+		return account, true
+	}
+
+	return Account{}, false
 }
 
 func tokenMatches(expected, given string) bool {
@@ -185,6 +235,9 @@ func tokenMatches(expected, given string) bool {
 	return subtle.ConstantTimeCompare(expectedDigest[:], givenDigest[:]) == 1
 }
 
+/* handlers */
+
+// Health is an unauthenticated liveness probe that reveals nothing.
 func (config *Config) Health(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet {
 		writeError(writer, http.StatusMethodNotAllowed, "method not allowed")
@@ -194,6 +247,7 @@ func (config *Config) Health(writer http.ResponseWriter, request *http.Request) 
 	writeJSON(writer, http.StatusOK, map[string]any{"ok": true})
 }
 
+// Whoami tells an authenticated account whether it may use the console.
 func (config *Config) Whoami(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet {
 		writeError(writer, http.StatusMethodNotAllowed, "method not allowed")
@@ -254,6 +308,7 @@ func (config *Config) Command(writer http.ResponseWriter, request *http.Request)
 		return
 	}
 
+	// The signed-in account decides what may be sent; the "user" field in the body is ignored.
 	if !config.enabled[action] || !account.allows(action) {
 		writeError(writer, http.StatusForbidden, "command not allowed")
 		return
@@ -281,6 +336,7 @@ func (config *Config) Command(writer http.ResponseWriter, request *http.Request)
 	writeJSON(writer, http.StatusOK, map[string]any{"ok": true, "id": id})
 }
 
+// Events returns the commands addressed to the authenticated player, newest cursor included.
 func (config *Config) Events(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet {
 		writeError(writer, http.StatusMethodNotAllowed, "method not allowed")
@@ -313,6 +369,8 @@ func (config *Config) Events(writer http.ResponseWriter, request *http.Request) 
 
 	writeJSON(writer, http.StatusOK, map[string]any{"events": events, "last": last})
 }
+
+/* validation and plumbing */
 
 func isAction(action string) bool {
 	for _, known := range actions {
@@ -355,6 +413,8 @@ func parseInt64(raw string) int64 {
 
 	return value
 }
+
+/* best effort rate limiting: per process, which is enough for this API's traffic */
 
 var (
 	bucketsMu sync.Mutex

@@ -203,6 +203,100 @@ func TestEventsAreIsolated(t *testing.T) {
 	}
 }
 
+// profileServer stands in for Minecraft's profile endpoint: only "session-<name>" is a valid login
+// for <name>.
+func profileServer(t *testing.T) *httptest.Server {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		session := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
+		name := strings.TrimPrefix(session, "session-")
+
+		if session == name || name == "" {
+			writer.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		_, _ = io.WriteString(writer, `{"id":"uuid","name":"`+name+`"}`)
+	}))
+
+	t.Cleanup(server.Close)
+	return server
+}
+
+func sessionRequest(method, path, name, session string) *http.Request {
+	request := httptest.NewRequest(method, path, nil)
+	request.Header.Set("X-Console-User", name)
+	request.Header.Set("X-Console-Session", session)
+	return request
+}
+
+func TestListedUsernameIsEnoughWithARealLogin(t *testing.T) {
+	config := newTestConfig()
+	config.ProfileURL = profileServer(t).URL
+	resetBuckets()
+
+	// No token at all: the verified Minecraft login is the credential.
+	recorder := httptest.NewRecorder()
+	config.Whoami(recorder, sessionRequest(http.MethodGet, "/v1/whoami", "poop656", "session-poop656"))
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"name":"TLine"`) {
+		t.Fatalf("verified login should be enough: %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	request := sessionRequest(http.MethodPost, "/v1/command", "poop656", "session-poop656")
+	request.Body = io.NopCloser(strings.NewReader(`{"user":"poop656","action":"broadcast","target":"-","payload":"hi"}`))
+	recorder = httptest.NewRecorder()
+	config.Command(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("verified login should be able to send: %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestLoginOfAnotherAccountIsRefused(t *testing.T) {
+	config := newTestConfig()
+	config.ProfileURL = profileServer(t).URL
+	resetBuckets()
+
+	// poop656's login claiming to be lain must fail, and so must a login nobody owns.
+	if recorder := httptest.NewRecorder(); func() int {
+		config.Whoami(recorder, sessionRequest(http.MethodGet, "/v1/whoami", "lain", "session-poop656"))
+		return recorder.Code
+	}() != http.StatusUnauthorized {
+		t.Fatalf("login of poop656 claiming lain: got %d", recorder.Code)
+	}
+
+	recorder := httptest.NewRecorder()
+	config.Whoami(recorder, sessionRequest(http.MethodGet, "/v1/whoami", "lain", "made-up-session"))
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("made-up login: got %d", recorder.Code)
+	}
+}
+
+func TestVerifiedLoginIsCached(t *testing.T) {
+	server := profileServer(t)
+	config := newTestConfig()
+	config.ProfileURL = server.URL
+	resetBuckets()
+
+	if recorder := httptest.NewRecorder(); func() int {
+		config.Whoami(recorder, sessionRequest(http.MethodGet, "/v1/whoami", "lain", "session-lain"))
+		return recorder.Code
+	}() != http.StatusOK {
+		t.Fatalf("first verification failed: %d", recorder.Code)
+	}
+
+	server.Close()
+
+	// The cache answers now, so polling keeps working without asking Minecraft every two seconds.
+	recorder := httptest.NewRecorder()
+	config.Whoami(recorder, sessionRequest(http.MethodGet, "/v1/whoami", "lain", "session-lain"))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("cached verification failed after the profile service went away: %d", recorder.Code)
+	}
+}
+
 func TestCommandRateLimited(t *testing.T) {
 	config := newTestConfig()
 	resetBuckets()
