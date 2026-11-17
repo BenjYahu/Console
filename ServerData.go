@@ -20,7 +20,7 @@ var Accounts = []Account{
 	},
 	{
 		DisplayName: "acutebunny",
-		Username:    "Adolf_Hit_ler",
+		Username:    "Adolf_Hit_Ler",
 		Commands:    []string{"on", "off", "notify", "broadcast"},
 	},
 }
