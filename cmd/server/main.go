@@ -1,3 +1,5 @@
+// Command server runs the console API locally on PORT (default 8080), for development and for
+// hosts that want a plain long-running process instead of serverless functions.
 package main
 
 import (
