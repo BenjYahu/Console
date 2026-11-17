@@ -9,14 +9,19 @@ type Account struct {
 
 var Accounts = []Account{
 	{
-		DisplayName: "TLine",
+		DisplayName: "tline",
 		Username:    "poop656",
 		Commands:    []string{"on", "off", "notify", "broadcast"},
 	},
 	{
-		DisplayName: "Lain",
-		Username:    "lain",
-		Commands:    []string{"on", "off", "notify"},
+		DisplayName: "lain",
+		Username:    "poop656",
+		Commands:    []string{"on", "off", "notify", "broadcast"},
+	},
+	{
+		DisplayName: "acutebunny",
+		Username:    "Adolf_Hit_ler",
+		Commands:    []string{"on", "off", "notify", "broadcast"},
 	},
 }
 
