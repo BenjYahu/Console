@@ -1,0 +1,18 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    { "source": "/v1/health", "destination": "/api/health" },
+    { "source": "/v1/whoami", "destination": "/api/whoami" },
+    { "source": "/v1/command", "destination": "/api/command" },
+    { "source": "/v1/events", "destination": "/api/events" }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Cache-Control", "value": "no-store" }
+      ]
+    }
+  ]
+}
