@@ -14,9 +14,14 @@ var Accounts = []Account{
 		Commands:    []string{"on", "off", "notify", "broadcast"},
 	},
 	{
-		DisplayName: "Lain",
-		Username:    "lain",
-		Commands:    []string{"on", "off", "notify"},
+		DisplayName: "lain",
+		Username:    "poop656",
+		Commands:    []string{"on", "off", "notify", "broadcast"},
+	},
+	{
+		DisplayName: "acutebunny",
+		Username:    "Adolf_Hit_ler",
+		Commands:    []string{"on", "off", "notify", "broadcast"},
 	},
 }
 
