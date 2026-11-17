@@ -1,3 +1,5 @@
+// Command server runs the console API locally on PORT (default 8080), for development and for
+// hosts that want a plain long-running process instead of serverless functions.
 package main
 
 import (
@@ -17,12 +19,14 @@ func main() {
 
 	config := console.Default()
 
-	if config.Secret == "" {
-		log.Println("warning: CONSOLE_SECRET is empty, every request will be refused")
+	for _, warning := range config.Warnings() {
+		log.Println("warning: " + warning)
 	}
 
-	if len(config.Accounts) == 0 {
-		log.Println("warning: CONSOLE_ACCOUNTS is empty, no account may use the console")
+	if config.Shared {
+		log.Println("using the shared KV store")
+	} else {
+		log.Println("using the in-memory store: fine locally, but every serverless instance would see different events")
 	}
 
 	mux := http.NewServeMux()
