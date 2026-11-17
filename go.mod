@@ -1,3 +1,3 @@
-module github.com/revoke-wtf/console-api
+module github.com/BenjYahu/Console
 
 go 1.22
