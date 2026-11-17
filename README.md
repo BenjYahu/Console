@@ -1,7 +1,7 @@
 # Revoke console API (.go)
 
 Control plane for the Revoke client's remote console. Plain Go standard library, deployed as Vercel
-Go functions at `https://api.revoke.wtf`.
+Go functions at `https://revoke.wtf/api`.
 
 ## Where things are configured
 
@@ -45,10 +45,12 @@ permissions and as the broadcast signature.
 
 | Method | Path          | Auth | Purpose                                            |
 | ------ | ------------- | ---- | -------------------------------------------------- |
-| GET    | `/v1/health`  | no   | Liveness probe                                     |
-| GET    | `/v1/whoami`  | yes  | `{"allowed":true,"name":"<DisplayName>"}` or `401` |
-| POST   | `/v1/command` | yes  | `{"action":"on\|off\|notify\|broadcast","target":"name","payload":"..."}` |
-| GET    | `/v1/events`  | yes  | Commands addressed to the caller, `?since=<cursor>` |
+| GET    | `/api/v1/health`  | no   | Liveness probe                                |
+| GET    | `/api/v1/whoami`  | yes  | `{"allowed":true,"name":"<DisplayName>"}` or `401` |
+| POST   | `/api/v1/command` | yes  | `{"action":"on\|off\|notify\|broadcast","target":"name","payload":"..."}` |
+| GET    | `/api/v1/events`  | yes  | Commands addressed to the caller, `?since=<cursor>` |
+
+The older `/v1/...` paths stay aliased to the same functions.
 
 Missing or wrong token, or an unknown name: `401`. Signed in but that account may not use the
 command: `403`. Malformed request: `400`. Flooding: `429`. Broadcasts reach every client and carry
@@ -58,19 +60,31 @@ command: `403`. Malformed request: `400`. Flooding: `429`. Broadcasts reach ever
 
 | Variable                     | Required  | Meaning                                            |
 | ---------------------------- | --------- | -------------------------------------------------- |
+| `MONGO_URI`                  | on Vercel | MongoDB connection string, e.g. `mongodb+srv://user:pass@cluster/revoke` |
 | `CONSOLE_TOKEN_<USERNAME>`   | optional  | Fallback token for that account (`openssl rand -hex 32`) |
-| `KV_REST_API_URL`            | on Vercel | Vercel KV / Upstash REST URL                       |
-| `KV_REST_API_TOKEN`          | on Vercel | Matching REST token                                |
 
-Serverless instances do not share memory, so the shared store is required on Vercel: a command
-stored by one instance would otherwise never reach a poll landing on another. `UPSTASH_*` names work
-too. Without the variables the API keeps events in memory, which is fine for local runs.
+Serverless instances do not share memory, so the shared database is required on Vercel: a command
+stored by one instance would otherwise never reach a poll landing on another. Without `MONGO_URI`
+the API keeps events in memory, which is fine for local runs.
+
+### MongoDB layout
+
+Two collections in the database named by the URI path (`revoke` when the URI names none):
+
+- `console_events` — one document per command: `id`, `from`, `action`, `target`, `targetKey`,
+  `payload`, `time`, `createdAt`. Its `id` comes from a counter document so ids stay ordered across
+  instances; a TTL index on `createdAt` drops commands once they expire.
+- `console_counters` — the `events` counter that hands out those ids.
+
+Indexes are created once per instance in the background, so the API works on an empty database with
+no migration step. Use a database user limited to this database; the API only inserts events,
+reads them and increments the counter.
 
 ## Run locally
 
 ```bash
 CONSOLE_TOKEN_POOP656=dev-token go run ./cmd/server
-curl http://127.0.0.1:8080/v1/health
+curl http://127.0.0.1:8080/api/v1/health
 go test ./...
 ```
 
@@ -87,10 +101,14 @@ vercel            # preview
 vercel --prod     # production
 ```
 
-`vercel.json` maps `/v1/health`, `/v1/whoami`, `/v1/command` and `/v1/events` onto the Go functions
-in `api/`, so the client's hardcoded `api.revoke.wtf/v1/...` URLs keep working. Point the
-`api.revoke.wtf` domain at the project in Vercel → Settings → Domains.
+`vercel.json` maps `/api/v1/health`, `/api/v1/whoami`, `/api/v1/command` and `/api/v1/events` onto the
+Go functions in `api/`, matching the client's hardcoded `revoke.wtf/api/v1/...` URLs. Point
+`revoke.wtf` at the project in Vercel → Settings → Domains; the four Go functions live under
+`/api/…`, so no other rewrite is needed.
 
 Client side: nothing to configure when the launcher provides a Minecraft login — the client sends
 it automatically. For a launcher that does not, put that account's fallback token in
 `run/console.token` (one line, nothing else) or in `REVOKE_CONSOLE_TOKEN`.
+
+`go.mod` and `go.sum` both need to be in the repository: Vercel downloads the MongoDB driver from
+them when it builds the functions.

@@ -1,6 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
+    { "source": "/api/v1/health", "destination": "/api/health" },
+    { "source": "/api/v1/whoami", "destination": "/api/whoami" },
+    { "source": "/api/v1/command", "destination": "/api/command" },
+    { "source": "/api/v1/events", "destination": "/api/events" },
     { "source": "/v1/health", "destination": "/api/health" },
     { "source": "/v1/whoami", "destination": "/api/whoami" },
     { "source": "/v1/command", "destination": "/api/command" },
