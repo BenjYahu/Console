@@ -73,8 +73,10 @@ type Config struct {
 	enabled  map[string]bool
 	// Store keeps events between requests.
 	Store Store
-	// Shared is true when a shared store (KV/Upstash) is configured.
+	// Shared is true when a store shared by every instance (MongoDB) is configured.
 	Shared bool
+	// StoreWarning explains why the configured store could not be opened, if it could not.
+	StoreWarning string
 	// ProfileURL overrides Minecraft's profile endpoint (used by tests); empty means the real one.
 	ProfileURL string
 	// Client makes that verification call; nil means a shared client.
@@ -139,8 +141,18 @@ func FromEnv() *Config {
 		config.accounts[strings.ToLower(username)] = account
 	}
 
-	config.Store = storeFromEnv()
-	_, config.Shared = config.Store.(*redisStore)
+	store, err := storeFromEnv(os.Getenv("MONGO_URI"))
+
+	if err != nil {
+		store = &memoryStore{}
+		config.StoreWarning = "MONGO_URI could not be opened, falling back to memory: " + err.Error()
+	}
+
+	config.Store = store
+
+	_, isMemory := store.(*memoryStore)
+	config.Shared = !isMemory
+
 	return config
 }
 
@@ -156,6 +168,10 @@ func tokenVariable(entry serverdata.Account) string {
 // Warnings describes configuration that will silently refuse everybody, for the server's log.
 func (config *Config) Warnings() []string {
 	var warnings []string
+
+	if config.StoreWarning != "" {
+		warnings = append(warnings, config.StoreWarning)
+	}
 
 	if len(config.accounts) == 0 {
 		warnings = append(warnings, "ServerData.go lists no usable account: every console command will be refused")

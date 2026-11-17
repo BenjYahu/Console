@@ -297,6 +297,51 @@ func TestVerifiedLoginIsCached(t *testing.T) {
 	}
 }
 
+func TestMongoURIInvalidFallsBackToMemory(t *testing.T) {
+	t.Setenv("MONGO_URI", "not-a-mongodb-uri")
+
+	config := FromEnv()
+
+	if config.Shared {
+		t.Fatal("an unusable MONGO_URI must not count as a shared store")
+	}
+
+	if config.StoreWarning == "" {
+		t.Fatal("expected a warning explaining the fallback")
+	}
+
+	if _, ok := config.Store.(*memoryStore); !ok {
+		t.Fatalf("expected the memory store, got %T", config.Store)
+	}
+}
+
+func TestMongoDatabaseName(t *testing.T) {
+	cases := map[string]string{
+		"mongodb://localhost:27017/revoke":                           "revoke",
+		"mongodb+srv://user:pass@cluster.mongodb.net/mydb?a=b":       "mydb",
+		"mongodb://localhost:27017":                                  DefaultDatabase,
+		"mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=1": DefaultDatabase,
+	}
+
+	for uri, expected := range cases {
+		if actual := databaseName(uri); actual != expected {
+			t.Fatalf("%s: got database %q, want %q", uri, actual, expected)
+		}
+	}
+}
+
+func TestMongoUnreachableFailsSoft(t *testing.T) {
+	store, err := newMongoStore("mongodb://127.0.0.1:27099/?serverSelectionTimeoutMS=300&connectTimeoutMS=300")
+
+	if err != nil {
+		t.Fatalf("a lazy connection should not fail at startup: %v", err)
+	}
+
+	if _, err := store.Append("TLine", "off", "lain", "Flight"); err == nil {
+		t.Fatal("expected an error when the database is unreachable")
+	}
+}
+
 func TestCommandRateLimited(t *testing.T) {
 	config := newTestConfig()
 	resetBuckets()
