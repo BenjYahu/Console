@@ -1,10 +1,13 @@
+// Package console implements the Revoke console API.
+//
+// The API is the whole control plane for the client's console. Who may do what comes from
+// ServerData.go at the module root; each account there proves itself with its own token, so a
+// request carrying somebody else's name is refused even though the whitelist is public.
 package console
 
 import (
-	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -13,26 +16,33 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	serverdata "github.com/BenjYahu/Console"
 )
 
 const (
+	// Retention is how long a command stays deliverable.
 	Retention = 15 * time.Minute
 
+	// MaxEvents bounds how many commands are kept.
 	MaxEvents = 500
 
+	// MaxBody caps a request body, so an oversized post cannot be used as a memory hammer.
 	MaxBody = 8 << 10
 
+	// MaxPayload caps the message/feature carried by a command.
 	MaxPayload = 512
 
 	commandPerMinute = 60
 	eventsPerMinute  = 240
 )
 
-var (
-	namePattern = regexp.MustCompile(`^[A-Za-z0-9_]{1,16}$`)
-	actions     = map[string]bool{"on": true, "off": true, "notify": true, "broadcast": true}
-)
+var namePattern = regexp.MustCompile(`^[A-Za-z0-9_]{1,16}$`)
 
+// Action names the client understands. ServerData.go decides which of them are switched on.
+var actions = []string{"on", "off", "notify", "broadcast"}
+
+// Event is one console command, addressed to a target or to everybody (broadcast).
 type Event struct {
 	ID      int64  `json:"id"`
 	From    string `json:"from"`
@@ -42,10 +52,29 @@ type Event struct {
 	Time    int64  `json:"time"`
 }
 
+// Account is one entry of ServerData.go with its token already read from the environment.
+type Account struct {
+	// Display is the name other players see on broadcasts.
+	Display string
+	// Username is the Minecraft name this account must send.
+	Username string
+	token    string
+	// commands is nil when the account may use every enabled command.
+	commands map[string]bool
+}
+
+func (account Account) allows(action string) bool {
+	return account.commands == nil || account.commands[action]
+}
+
+// Config is everything the API needs to answer a request.
 type Config struct {
-	Secret string
-	Accounts map[string]string
-	Store    Store
+	accounts map[string]Account // lower-cased username -> account
+	enabled  map[string]bool
+	// Store keeps events between requests.
+	Store Store
+	// Shared is true when a shared store (KV/Upstash) is configured.
+	Shared bool
 }
 
 var (
@@ -53,6 +82,7 @@ var (
 	defaultConfig *Config
 )
 
+// Default returns the process-wide configuration, built once per instance.
 func Default() *Config {
 	defaultOnce.Do(func() {
 		defaultConfig = FromEnv()
@@ -60,36 +90,102 @@ func Default() *Config {
 	return defaultConfig
 }
 
+// FromEnv resolves ServerData.go against the environment: each account's token comes from its
+// TokenEnv variable (or CONSOLE_TOKEN_<USERNAME>), never from the repository.
 func FromEnv() *Config {
 	config := &Config{
-		Secret:   strings.TrimSpace(os.Getenv("CONSOLE_SECRET")),
-		Accounts: map[string]string{},
+		accounts: map[string]Account{},
+		enabled:  map[string]bool{},
 	}
 
-	for _, entry := range strings.Split(os.Getenv("CONSOLE_ACCOUNTS"), ",") {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
+	for _, action := range serverdata.EnabledCommands {
+		action = strings.ToLower(strings.TrimSpace(action))
+		if isAction(action) {
+			config.enabled[action] = true
+		}
+	}
+
+	for _, entry := range serverdata.Accounts {
+		username := strings.TrimSpace(entry.Username)
+
+		if !namePattern.MatchString(username) {
 			continue
 		}
 
-		name, display := entry, entry
+		display := strings.TrimSpace(entry.DisplayName)
 
-		if index := strings.Index(entry, ":"); index > 0 {
-			name, display = entry[:index], entry[index+1:]
+		if display == "" {
+			display = username
 		}
 
-		if namePattern.MatchString(name) {
-			config.Accounts[strings.ToLower(name)] = display
+		account := Account{
+			Display:  display,
+			Username: username,
+			token:    strings.TrimSpace(os.Getenv(tokenVariable(entry))),
 		}
+
+		if len(entry.Commands) > 0 {
+			account.commands = map[string]bool{}
+
+			for _, action := range entry.Commands {
+				account.commands[strings.ToLower(strings.TrimSpace(action))] = true
+			}
+		}
+
+		config.accounts[strings.ToLower(username)] = account
 	}
 
 	config.Store = storeFromEnv()
+	_, config.Shared = config.Store.(*redisStore)
 	return config
 }
 
-func (config *Config) Authorize(request *http.Request) (string, bool) {
-	if config == nil || config.Secret == "" {
-		return "", false
+// tokenVariable is the environment variable holding an account's token.
+func tokenVariable(entry serverdata.Account) string {
+	if name := strings.TrimSpace(entry.TokenEnv); name != "" {
+		return name
+	}
+
+	return "CONSOLE_TOKEN_" + strings.ToUpper(strings.TrimSpace(entry.Username))
+}
+
+// Warnings describes configuration that will silently refuse everybody, for the server's log.
+func (config *Config) Warnings() []string {
+	var warnings []string
+
+	if len(config.accounts) == 0 {
+		warnings = append(warnings, "ServerData.go lists no usable account: every console command will be refused")
+	}
+
+	if len(config.enabled) == 0 {
+		warnings = append(warnings, "ServerData.go enables no command: every console command will be refused")
+	}
+
+	for _, entry := range serverdata.Accounts {
+		username := strings.TrimSpace(entry.Username)
+
+		if !namePattern.MatchString(username) {
+			warnings = append(warnings, "ServerData.go skips an account with an invalid Minecraft name: "+username)
+			continue
+		}
+
+		if strings.TrimSpace(os.Getenv(tokenVariable(entry))) == "" {
+			warnings = append(warnings, "no token set for "+username+": export "+tokenVariable(entry))
+		}
+	}
+
+	return warnings
+}
+
+// Authorize returns the account behind a request.
+//
+// The client sends its Minecraft name plus its own token. The name only picks the entry; the token
+// is what proves the request comes from that account, so naming somebody else gets a 401 unless the
+// caller also holds their token. Digests are compared in constant time so a wrong token costs the
+// same as a wrong name.
+func (config *Config) Authorize(request *http.Request) (Account, bool) {
+	if config == nil {
+		return Account{}, false
 	}
 
 	name := strings.TrimSpace(request.Header.Get("X-Console-User"))
@@ -99,31 +195,31 @@ func (config *Config) Authorize(request *http.Request) (string, bool) {
 	}
 
 	if !namePattern.MatchString(name) {
-		return "", false
+		return Account{}, false
 	}
 
-	display, allowed := config.Accounts[strings.ToLower(name)]
+	account, known := config.accounts[strings.ToLower(name)]
 
-	if !allowed {
-		return "", false
+	if !known || !tokenMatches(account.token, strings.TrimSpace(request.Header.Get("X-Console-Token"))) {
+		return Account{}, false
 	}
 
-	given := strings.ToLower(strings.TrimSpace(request.Header.Get("X-Console-Token")))
-	expected := config.token(name)
-
-	if subtle.ConstantTimeCompare([]byte(given), []byte(expected)) != 1 {
-		return "", false
-	}
-
-	return display, true
+	return account, true
 }
 
-func (config *Config) token(name string) string {
-	mac := hmac.New(sha256.New, []byte(config.Secret))
-	mac.Write([]byte(strings.ToLower(strings.TrimSpace(name))))
-	return hex.EncodeToString(mac.Sum(nil))
+func tokenMatches(expected, given string) bool {
+	if expected == "" || given == "" {
+		return false
+	}
+
+	expectedDigest := sha256.Sum256([]byte(expected))
+	givenDigest := sha256.Sum256([]byte(given))
+	return subtle.ConstantTimeCompare(expectedDigest[:], givenDigest[:]) == 1
 }
 
+/* handlers */
+
+// Health is an unauthenticated liveness probe that reveals nothing.
 func (config *Config) Health(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet {
 		writeError(writer, http.StatusMethodNotAllowed, "method not allowed")
@@ -140,30 +236,31 @@ func (config *Config) Whoami(writer http.ResponseWriter, request *http.Request) 
 		return
 	}
 
-	display, ok := config.Authorize(request)
+	account, ok := config.Authorize(request)
 
 	if !ok {
 		writeError(writer, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
-	writeJSON(writer, http.StatusOK, map[string]any{"allowed": true, "name": display})
+	writeJSON(writer, http.StatusOK, map[string]any{"allowed": true, "name": account.Display})
 }
 
+// Command stores a console command for delivery to its target.
 func (config *Config) Command(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodPost {
 		writeError(writer, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
-	display, ok := config.Authorize(request)
+	account, ok := config.Authorize(request)
 
 	if !ok {
 		writeError(writer, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
-	if !allow("command:"+strings.ToLower(display), commandPerMinute) {
+	if !allow("command:"+strings.ToLower(account.Username), commandPerMinute) {
 		writeError(writer, http.StatusTooManyRequests, "rate limited")
 		return
 	}
@@ -188,8 +285,14 @@ func (config *Config) Command(writer http.ResponseWriter, request *http.Request)
 	target := strings.TrimSpace(body.Target)
 	payload := strings.TrimSpace(body.Payload)
 
-	if !actions[action] {
+	if !isAction(action) {
 		writeError(writer, http.StatusBadRequest, "unknown action")
+		return
+	}
+
+	// The signed-in account decides what may be sent; the "user" field in the body is ignored.
+	if !config.enabled[action] || !account.allows(action) {
+		writeError(writer, http.StatusForbidden, "command not allowed")
 		return
 	}
 
@@ -205,7 +308,7 @@ func (config *Config) Command(writer http.ResponseWriter, request *http.Request)
 		return
 	}
 
-	id, err := config.Store.Append(display, action, target, payload)
+	id, err := config.Store.Append(account.Display, action, target, payload)
 
 	if err != nil {
 		writeError(writer, http.StatusServiceUnavailable, "store unavailable")
@@ -215,26 +318,27 @@ func (config *Config) Command(writer http.ResponseWriter, request *http.Request)
 	writeJSON(writer, http.StatusOK, map[string]any{"ok": true, "id": id})
 }
 
+// Events returns the commands addressed to the authenticated player, newest cursor included.
 func (config *Config) Events(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet {
 		writeError(writer, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
-	display, ok := config.Authorize(request)
+	account, ok := config.Authorize(request)
 
 	if !ok {
 		writeError(writer, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
-	if !allow("events:"+strings.ToLower(display), eventsPerMinute) {
+	if !allow("events:"+strings.ToLower(account.Username), eventsPerMinute) {
 		writeError(writer, http.StatusTooManyRequests, "rate limited")
 		return
 	}
 
 	since := parseInt64(request.URL.Query().Get("since"))
-	events, last, err := config.Store.Since(strings.ToLower(display), since, time.Now().Add(-Retention))
+	events, last, err := config.Store.Since(strings.ToLower(account.Username), since, time.Now().Add(-Retention))
 
 	if err != nil {
 		writeError(writer, http.StatusServiceUnavailable, "store unavailable")
@@ -246,6 +350,18 @@ func (config *Config) Events(writer http.ResponseWriter, request *http.Request) 
 	}
 
 	writeJSON(writer, http.StatusOK, map[string]any{"events": events, "last": last})
+}
+
+/* validation and plumbing */
+
+func isAction(action string) bool {
+	for _, known := range actions {
+		if action == known {
+			return true
+		}
+	}
+
+	return false
 }
 
 func validPayload(payload string) bool {

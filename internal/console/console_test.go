@@ -1,9 +1,6 @@
 package console
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -12,36 +9,34 @@ import (
 	"testing"
 )
 
-const testSecret = "unit-test-secret"
+const (
+	poop656Token = "token-for-poop656"
+	lainToken    = "token-for-lain"
+)
 
 func newTestConfig() *Config {
 	return &Config{
-		Secret:   testSecret,
-		Accounts: map[string]string{"poop656": "poop656", "lain": "lain"},
-		Store:    &memoryStore{},
+		accounts: map[string]Account{
+			"poop656": {Display: "TLine", Username: "poop656", token: poop656Token},
+			"lain":    {Display: "Lain", Username: "lain", token: lainToken, commands: map[string]bool{"on": true, "notify": true}},
+		},
+		enabled: map[string]bool{"on": true, "off": true, "notify": true, "broadcast": true},
+		Store:   &memoryStore{},
 	}
 }
 
-func sign(name string) string {
-	mac := hmac.New(sha256.New, []byte(testSecret))
-	mac.Write([]byte(strings.ToLower(name)))
-	return hex.EncodeToString(mac.Sum(nil))
+func authed(method, path, name, token string) *http.Request {
+	request := httptest.NewRequest(method, path, nil)
+	request.Header.Set("X-Console-User", name)
+	request.Header.Set("X-Console-Token", token)
+	return request
 }
 
-func request(method, path, name, token string) *http.Request {
-	target := path
-
-	if name != "" {
-		target += "?user=" + name
-	}
-
-	return httptest.NewRequest(method, target, nil)
-}
-
-func authed(method, path, name string) *http.Request {
-	recorder := request(method, path, name, "")
-	recorder.Header.Set("X-Console-User", name)
-	recorder.Header.Set("X-Console-Token", sign(name))
+func postCommand(config *Config, name, token, body string) *httptest.ResponseRecorder {
+	request := authed(http.MethodPost, "/v1/command", name, token)
+	request.Body = io.NopCloser(strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	config.Command(recorder, request)
 	return recorder
 }
 
@@ -59,15 +54,10 @@ func TestWhoami(t *testing.T) {
 		req    *http.Request
 		status int
 	}{
-		{"no token", request(http.MethodGet, "/v1/whoami", "poop656", ""), http.StatusUnauthorized},
-		{"wrong token", func() *http.Request {
-			r := request(http.MethodGet, "/v1/whoami", "poop656", "")
-			r.Header.Set("X-Console-User", "poop656")
-			r.Header.Set("X-Console-Token", strings.Repeat("0", 64))
-			return r
-		}(), http.StatusUnauthorized},
-		{"not whitelisted", authed(http.MethodGet, "/v1/whoami", "randomguy"), http.StatusUnauthorized},
-		{"case insensitive", authed(http.MethodGet, "/v1/whoami", "Poop656"), http.StatusOK},
+		{"no token", authed(http.MethodGet, "/v1/whoami", "poop656", ""), http.StatusUnauthorized},
+		{"wrong token", authed(http.MethodGet, "/v1/whoami", "poop656", "nope"), http.StatusUnauthorized},
+		{"unknown name", authed(http.MethodGet, "/v1/whoami", "randomguy", poop656Token), http.StatusUnauthorized},
+		{"case insensitive name", authed(http.MethodGet, "/v1/whoami", "Poop656", poop656Token), http.StatusOK},
 	}
 
 	for _, testCase := range cases {
@@ -80,22 +70,71 @@ func TestWhoami(t *testing.T) {
 	}
 }
 
-func TestHealthNeedsNoAuth(t *testing.T) {
+func TestWhoamiReturnsDisplayName(t *testing.T) {
 	recorder := httptest.NewRecorder()
-	newTestConfig().Health(recorder, request(http.MethodGet, "/v1/health", "", ""))
+	newTestConfig().Whoami(recorder, authed(http.MethodGet, "/v1/whoami", "poop656", poop656Token))
 
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("health: got %d", recorder.Code)
+	if !strings.Contains(recorder.Body.String(), `"name":"TLine"`) {
+		t.Fatalf("display name missing: %s", recorder.Body.String())
 	}
 }
 
-func TestNoSecretFailsClosed(t *testing.T) {
-	config := &Config{Accounts: map[string]string{"poop656": "poop656"}, Store: &memoryStore{}}
-	recorder := httptest.NewRecorder()
-	config.Whoami(recorder, authed(http.MethodGet, "/v1/whoami", "poop656"))
+func TestImpersonationIsRefused(t *testing.T) {
+	config := newTestConfig()
 
-	if recorder.Code != http.StatusUnauthorized {
-		t.Fatalf("empty secret must refuse: got %d", recorder.Code)
+	// Claiming another whitelisted account with your own token must fail.
+	if recorder := postCommand(config, "lain", poop656Token, `{"user":"lain","action":"on","target":"lain","payload":"Flight"}`); recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("lain with poop656's token: got %d", recorder.Code)
+	}
+
+	// A token that belongs to nobody must fail just the same.
+	if recorder := postCommand(config, "poop656", "guess", `{"user":"poop656","action":"off","target":"lain","payload":"Flight"}`); recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("bad token: got %d", recorder.Code)
+	}
+}
+
+func TestBodyUserIsIgnored(t *testing.T) {
+	config := newTestConfig()
+
+	// poop656 signs the request but the body claims to be lain: the event must be signed as TLine.
+	if recorder := postCommand(config, "poop656", poop656Token, `{"user":"lain","action":"notify","target":"lain","payload":"hi"}`); recorder.Code != http.StatusOK {
+		t.Fatalf("command failed: %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	recorder := httptest.NewRecorder()
+	config.Events(recorder, authed(http.MethodGet, "/v1/events?since=0", "lain", lainToken))
+
+	if !strings.Contains(recorder.Body.String(), `"from":"TLine"`) {
+		t.Fatalf("event should be signed by the authenticated account: %s", recorder.Body.String())
+	}
+}
+
+func TestPerAccountCommands(t *testing.T) {
+	config := newTestConfig()
+	resetBuckets()
+
+	// lain may not broadcast, poop656 may.
+	if recorder := postCommand(config, "lain", lainToken, `{"user":"lain","action":"broadcast","target":"-","payload":"hello"}`); recorder.Code != http.StatusForbidden {
+		t.Fatalf("lain broadcast: got %d", recorder.Code)
+	}
+
+	if recorder := postCommand(config, "poop656", poop656Token, `{"user":"poop656","action":"broadcast","target":"-","payload":"hello"}`); recorder.Code != http.StatusOK {
+		t.Fatalf("poop656 broadcast: got %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	// lain may notify.
+	if recorder := postCommand(config, "lain", lainToken, `{"user":"lain","action":"notify","target":"poop656","payload":"hi"}`); recorder.Code != http.StatusOK {
+		t.Fatalf("lain notify: got %d", recorder.Code)
+	}
+}
+
+func TestGloballyDisabledCommand(t *testing.T) {
+	config := newTestConfig()
+	delete(config.enabled, "notify")
+	resetBuckets()
+
+	if recorder := postCommand(config, "poop656", poop656Token, `{"user":"poop656","action":"notify","target":"lain","payload":"hi"}`); recorder.Code != http.StatusForbidden {
+		t.Fatalf("disabled command accepted: got %d", recorder.Code)
 	}
 }
 
@@ -113,18 +152,12 @@ func TestCommandValidation(t *testing.T) {
 		{"too long", `{"user":"poop656","action":"off","target":"lain","payload":"` + strings.Repeat("a", MaxPayload+1) + `"}`, http.StatusBadRequest},
 		{"unknown field", `{"user":"poop656","action":"off","target":"lain","payload":"x","admin":true}`, http.StatusBadRequest},
 		{"valid", `{"user":"poop656","action":"off","target":"lain","payload":"Flight"}`, http.StatusOK},
-		{"broadcast", `{"user":"poop656","action":"broadcast","target":"ignored","payload":"hello all"}`, http.StatusOK},
 	}
 
 	for _, testCase := range bodies {
 		resetBuckets()
-		request := authed(http.MethodPost, "/v1/command", "poop656")
-		request.Body = io.NopCloser(strings.NewReader(testCase.body))
 
-		recorder := httptest.NewRecorder()
-		config.Command(recorder, request)
-
-		if recorder.Code != testCase.code {
+		if recorder := postCommand(config, "poop656", poop656Token, testCase.body); recorder.Code != testCase.code {
 			t.Fatalf("%s: got %d, want %d (%s)", testCase.name, recorder.Code, testCase.code, recorder.Body.String())
 		}
 	}
@@ -133,24 +166,18 @@ func TestCommandValidation(t *testing.T) {
 func TestEventsAreIsolated(t *testing.T) {
 	config := newTestConfig()
 
-	post := func(body string) {
-		request := authed(http.MethodPost, "/v1/command", "poop656")
-		request.Body = io.NopCloser(strings.NewReader(body))
-		recorder := httptest.NewRecorder()
-		config.Command(recorder, request)
-
-		if recorder.Code != http.StatusOK {
-			t.Fatalf("command failed: %d %s", recorder.Code, recorder.Body.String())
-		}
+	if recorder := postCommand(config, "poop656", poop656Token, `{"user":"poop656","action":"off","target":"lain","payload":"Flight"}`); recorder.Code != http.StatusOK {
+		t.Fatalf("command failed: %d %s", recorder.Code, recorder.Body.String())
 	}
 
-	post(`{"user":"poop656","action":"off","target":"lain","payload":"Flight"}`)
-	post(`{"user":"poop656","action":"broadcast","target":"-","payload":"everyone"}`)
+	if recorder := postCommand(config, "poop656", poop656Token, `{"user":"poop656","action":"broadcast","target":"-","payload":"everyone"}`); recorder.Code != http.StatusOK {
+		t.Fatalf("broadcast failed: %d %s", recorder.Code, recorder.Body.String())
+	}
 
-	collect := func(name string) []Event {
+	collect := func(name, token string) []Event {
 		resetBuckets()
 		recorder := httptest.NewRecorder()
-		config.Events(recorder, authed(http.MethodGet, "/v1/events?since=0", name))
+		config.Events(recorder, authed(http.MethodGet, "/v1/events?since=0", name, token))
 
 		var body struct {
 			Events []Event `json:"events"`
@@ -164,8 +191,8 @@ func TestEventsAreIsolated(t *testing.T) {
 		return body.Events
 	}
 
-	lainEvents := collect("lain")
-	otherEvents := collect("poop656")
+	lainEvents := collect("lain", lainToken)
+	otherEvents := collect("poop656", poop656Token)
 
 	if len(lainEvents) != 2 {
 		t.Fatalf("lain should see the targeted command and the broadcast, saw %d", len(lainEvents))
@@ -183,11 +210,7 @@ func TestCommandRateLimited(t *testing.T) {
 	last := http.StatusOK
 
 	for attempt := 0; attempt < commandPerMinute+5; attempt++ {
-		request := authed(http.MethodPost, "/v1/command", "poop656")
-		request.Body = io.NopCloser(strings.NewReader(`{"user":"poop656","action":"off","target":"lain","payload":"Flight"}`))
-		recorder := httptest.NewRecorder()
-		config.Command(recorder, request)
-		last = recorder.Code
+		last = postCommand(config, "poop656", poop656Token, `{"user":"poop656","action":"off","target":"lain","payload":"Flight"}`).Code
 	}
 
 	if last != http.StatusTooManyRequests {
