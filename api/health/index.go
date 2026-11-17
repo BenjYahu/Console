@@ -6,6 +6,7 @@ import (
 	"github.com/BenjYahu/Console/internal/console"
 )
 
+// Handler serves the /v1/health endpoint.
 func Handler(writer http.ResponseWriter, request *http.Request) {
 	console.Default().Health(writer, request)
 }
