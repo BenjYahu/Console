@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/revoke-wtf/console-api/internal/console"
+	"github.com/BenjYahu/Console/internal/console"
 )
 
 func main() {
