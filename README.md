@@ -22,14 +22,24 @@ var EnabledCommands = []string{"on", "off", "notify", "broadcast"}
 - **Commands** limits one account to a subset of `EnabledCommands`; leave it empty for all of them.
   Comment a command out of `EnabledCommands` to switch it off for everybody.
 
-`ServerData.go` is committed, so it holds no secrets. Each account's token comes from its own
-environment variable (`CONSOLE_TOKEN_<USERNAME>`, or whatever `TokenEnv` names), and is compared in
-constant time against the `X-Console-Token` header.
+### How a request is authorized
 
-Because the name only selects an entry and the token proves it, someone who knows the whitelist —
-or has the source — cannot post a command as `lain` unless they hold `lain`'s token. The `user`
-field in a command body is ignored entirely: the signed-in account is used for permissions and as
-the broadcast signature. An account with no token set can never authenticate.
+Listing a Minecraft account is all it takes to let that person use the console — no per-account
+setup. The client sends `X-Console-User` with the name it is playing on and `X-Console-Session` with
+its live Minecraft login; the API asks Minecraft's profile service who that login belongs to and
+compares the answer with the name. Only the real owner of the account can pass, so a public
+whitelist, or somebody who has the source, still cannot post a command as `lain`.
+
+Successful checks are cached for ten minutes, so polling every two seconds does not hit Minecraft's
+service on every request. The session token itself is never stored, logged or written to the event
+store — only a fingerprint is kept as the cache key.
+
+A per-account token (`CONSOLE_TOKEN_<USERNAME>`, or whatever `TokenEnv` names) is accepted as a
+fallback for launchers that hand the game no live login. It is optional and lives only in the
+environment, never in this repository.
+
+The `user` field in a command body is ignored entirely: the authenticated account is used for
+permissions and as the broadcast signature.
 
 ## Endpoints
 
@@ -48,7 +58,7 @@ command: `403`. Malformed request: `400`. Flooding: `429`. Broadcasts reach ever
 
 | Variable                     | Required  | Meaning                                            |
 | ---------------------------- | --------- | -------------------------------------------------- |
-| `CONSOLE_TOKEN_<USERNAME>`   | per account | That account's token (`openssl rand -hex 32`)    |
+| `CONSOLE_TOKEN_<USERNAME>`   | optional  | Fallback token for that account (`openssl rand -hex 32`) |
 | `KV_REST_API_URL`            | on Vercel | Vercel KV / Upstash REST URL                       |
 | `KV_REST_API_TOKEN`          | on Vercel | Matching REST token                                |
 
@@ -68,6 +78,10 @@ The server prints a warning for every account whose token is missing.
 
 ## Deploy
 
+The repository is [`github.com/BenjYahu/Console`](https://github.com/BenjYahu/Console) and this
+module sits at its root, so import that repository in Vercel with the default root directory and add
+the token (and KV) variables — nothing else to configure.
+
 ```bash
 vercel            # preview
 vercel --prod     # production
@@ -77,6 +91,6 @@ vercel --prod     # production
 in `api/`, so the client's hardcoded `api.revoke.wtf/v1/...` URLs keep working. Point the
 `api.revoke.wtf` domain at the project in Vercel → Settings → Domains.
 
-Client side: put your own account's token in `run/console.token` (one line, nothing else) or in
-`REVOKE_CONSOLE_TOKEN`. Without it the console commands refuse to run instead of sending requests
-the API would reject.
+Client side: nothing to configure when the launcher provides a Minecraft login — the client sends
+it automatically. For a launcher that does not, put that account's fallback token in
+`run/console.token` (one line, nothing else) or in `REVOKE_CONSOLE_TOKEN`.
